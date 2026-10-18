@@ -482,3 +482,107 @@ export function alignTranscript(tokens, heardText) {
     score: tokens.length ? Math.round(okCount / tokens.length * 100) : 0,
   };
 }
+
+// ---------- 音声とスクリプトの時間合わせ・パート分割 ----------
+// heard: [{w, t}]  t = 秒。スクリプトの各トークンに時刻を割り当てる（合わない所は前後から補間）。
+export function timeTokens(tokens, heard) {
+  const S = []; for (const t of tokens) for (const x of expand(t.norm)) S.push({ w: x, t: t.i });
+  const H = []; for (const h of heard) { const n = normWord(h.w); if (n) for (const x of expand(n)) H.push({ w: x, t: h.t }); }
+  const m = S.length, n = H.length;
+  const times = new Array(tokens.length).fill(null);
+  if (!m || !n) return times;
+  const d = Array.from({ length: m + 1 }, () => new Int32Array(n + 1));
+  const bt = Array.from({ length: m + 1 }, () => new Int8Array(n + 1));
+  for (let i = 1; i <= m; i++) { d[i][0] = i; bt[i][0] = 1; }
+  for (let j = 1; j <= n; j++) { d[0][j] = j; bt[0][j] = 2; }
+  for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++) {
+    const eq = same(S[i - 1].w, H[j - 1].w);
+    let best = d[i - 1][j - 1] + (eq ? 0 : 1), b = eq ? 0 : 3;
+    if (d[i - 1][j] + 1 < best) { best = d[i - 1][j] + 1; b = 1; }
+    if (d[i][j - 1] + 1 < best) { best = d[i][j - 1] + 1; b = 2; }
+    d[i][j] = best; bt[i][j] = b;
+  }
+  let i = m, j = n;
+  while (i > 0 && j > 0) {
+    const b = bt[i][j];
+    if (b === 0) { times[S[i - 1].t] = H[j - 1].t; i--; j--; }   // 一致した語だけ時刻を採用
+    else if (b === 3) { i--; j--; }
+    else if (b === 1) i--; else j--;
+  }
+  // 補間
+  const known = times.map((t, k) => t == null ? null : k).filter(k => k != null);
+  if (!known.length) return times;
+  for (let k = 0; k < times.length; k++) {
+    if (times[k] != null) continue;
+    let a = known.filter(x => x < k).pop(), b = known.find(x => x > k);
+    if (a == null) times[k] = Math.max(0, times[b] - (b - k) * 0.35);
+    else if (b == null) times[k] = times[a] + (k - a) * 0.35;
+    else times[k] = times[a] + (times[b] - times[a]) * (k - a) / (b - a);
+  }
+  for (let k = 1; k < times.length; k++) if (times[k] < times[k - 1]) times[k] = times[k - 1];
+  return times;
+}
+
+const isSentEnd = raw => /[.!?…]["”’')\]]*$/.test(raw);
+const isClauseEnd = raw => /[,;:—–-]["”’')\]]*$/.test(raw) || /[—–]$/.test(raw);
+
+// スクリプトを約 target 秒ごとのパートに分ける。times が無ければ文字数から推定。
+export function makeParts(text, times, totalDur, target = 30) {
+  const toks = tokenize(text);
+  if (!toks.length) return [];
+  if (!times || times.every(t => t == null)) {
+    const total = totalDur || toks.length / 2.6; // 約156語/分
+    const len = text.length || 1;
+    times = toks.map(t => t.start / len * total);
+  }
+  const end = totalDur || (times[times.length - 1] + 1);
+  const tAt = k => k < toks.length ? times[k] : end;
+  // 文 → 長すぎる文は読点で分ける
+  const sents = []; let s0 = 0;
+  toks.forEach((t, k) => { if (isSentEnd(t.raw) || k === toks.length - 1) { sents.push([s0, k]); s0 = k + 1; } });
+  const units = [];
+  sents.forEach(([a, b], si) => {
+    if (tAt(b + 1) - tAt(a) <= target * 1.5) { units.push([a, b, si]); return; }
+    let u0 = a;
+    for (let k = a; k <= b; k++) {
+      if (k === b || (isClauseEnd(toks[k].raw) && tAt(k + 1) - tAt(u0) >= target * 0.6)) { units.push([u0, k, si]); u0 = k + 1; }
+      else if (tAt(k + 1) - tAt(u0) >= target * 1.3) { units.push([u0, k, si]); u0 = k + 1; }
+    }
+  });
+  const parts = []; let cur = null;
+  for (const [a, b, si] of units) {
+    if (cur && tAt(b + 1) - tAt(cur.from) > target * 1.25) { parts.push(cur); cur = null; }
+    if (!cur) cur = { from: a, to: b, s0: si, s1: si };
+    else { cur.to = b; cur.s1 = si; }
+    if (tAt(cur.to + 1) - tAt(cur.from) >= target * 0.8) { parts.push(cur); cur = null; }
+  }
+  if (cur) {
+    const last = parts[parts.length - 1];
+    if (last && tAt(cur.to + 1) - tAt(cur.from) < target * 0.35) { last.to = cur.to; last.s1 = cur.s1; } else parts.push(cur);
+  }
+  return parts.map((p, i) => ({
+    start: Math.max(0, i === 0 ? tAt(p.from) - 0.4 : tAt(p.from) - 0.25),
+    end: i === parts.length - 1 ? end : Math.min(end, tAt(p.to + 1) - 0.1),
+    text: text.slice(toks[p.from].start, toks[p.to].end),
+    sentFrom: p.s0, sentTo: p.s1, sentCount: sents.length,
+  }));
+}
+
+// 日本語訳を文に分ける
+export function splitJa(ja) {
+  return (ja || '').replace(/\r/g, '').split(/(?<=[。！？!?])\s*|\n+/).map(s => s.trim()).filter(Boolean);
+}
+// パートに対応する訳（英文の文の数と訳の文の数から対応付ける）
+export function jaForPart(jaSents, part) {
+  if (!jaSents.length) return '';
+  const N = part.sentCount || 1, M = jaSents.length;
+  const a = Math.floor(part.sentFrom * M / N), b = Math.max(a, Math.ceil((part.sentTo + 1) * M / N) - 1);
+  return jaSents.slice(a, b + 1).join('');
+}
+
+// 英文を文に分ける（翻訳用）
+export function splitSentences(text) {
+  const toks = tokenize(text); const out = []; let a = 0;
+  toks.forEach((t, k) => { if (isSentEnd(t.raw) || k === toks.length - 1) { out.push(text.slice(toks[a].start, t.end)); a = k + 1; } });
+  return out;
+}

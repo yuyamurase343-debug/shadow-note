@@ -1,5 +1,5 @@
 // オフライン用キャッシュ
-const VERSION = 'sn-v1';
+const VERSION = 'sn-v2';
 const SHELL = ['./', 'index.html', 'app.js', 'pron.js', 'worker.js', 'cmudict.txt', 'manifest.json', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));

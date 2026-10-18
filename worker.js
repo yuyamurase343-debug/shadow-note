@@ -23,7 +23,7 @@ async function load(model) {
 }
 
 self.onmessage = async (e) => {
-  const { type, id, model, audio } = e.data;
+  const { type, id, model, audio, timestamps } = e.data;
   try {
     if (type === 'load') {
       await load(model);
@@ -31,9 +31,11 @@ self.onmessage = async (e) => {
     } else if (type === 'transcribe') {
       const t = await load(model);
       self.postMessage({ type: 'status', id, text: '文字起こし中…' });
-      const out = await t(audio, { chunk_length_s: 30, stride_length_s: 5 });
-      const text = Array.isArray(out) ? out.map(o => o.text).join(' ') : out.text;
-      self.postMessage({ type: 'result', id, text: (text || '').trim() });
+      const out = await t(audio, { chunk_length_s: 30, stride_length_s: 5, return_timestamps: !!timestamps });
+      const o = Array.isArray(out) ? out[0] : out;
+      const text = (o.text || '').trim();
+      if (timestamps) self.postMessage({ type: 'result', id, text: { text, chunks: (o.chunks || []).map(c => ({ text: c.text, ts: c.timestamp })) } });
+      else self.postMessage({ type: 'result', id, text });
     }
   } catch (err) {
     self.postMessage({ type: 'error', id, message: String(err && err.message || err) });
